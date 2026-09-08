@@ -5,12 +5,15 @@
   "outputDirectory": "web/dist",
   "installCommand": "npm install",
   "functions": {
-    "api/[...path].ts": { "maxDuration": 300 },
+    "api/app.ts": { "maxDuration": 300 },
     "api/cron/metar.ts": { "maxDuration": 60 },
     "api/cron/taf.ts": { "maxDuration": 60 },
     "api/cron/nws.ts": { "maxDuration": 120 },
     "api/cron/models.ts": { "maxDuration": 200 }
   },
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "/api/app" }
+  ],
   "crons": [
     { "path": "/api/cron/metar", "schedule": "*/5 * * * *" },
     { "path": "/api/cron/taf", "schedule": "*/10 * * * *" },
