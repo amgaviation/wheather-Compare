@@ -6,6 +6,7 @@
  * weights that vary with lead time.
  */
 import type { DB } from '../db/index.js';
+import { DbError, selectAll } from '../db/index.js';
 import { CATEGORY_ORDER, CATEGORY_RANK, type FlightCategory, type TafHour } from '../wx/types.js';
 import { visValue } from '../wx/flightcat.js';
 import { latestMetar, latestTaf, type MetarRow, type StationRow, type TafRow } from './store.js';
@@ -178,7 +179,7 @@ interface ModelRow { model: ModelName; run_time: number; valid_time: number; tem
 
 const outlookCache = new Map<string, { at: number; value: Outlook }>();
 
-export function buildOutlook(db: DB, st: StationRow, horizonHours = 120, historyDays = 120): Outlook {
+export async function buildOutlook(db: DB, st: StationRow, horizonHours = 120, historyDays = 120): Promise<Outlook> {
   const key = `${st.icao}:${horizonHours}`;
   const cached = outlookCache.get(key);
   if (cached && Date.now() - cached.at < 5 * 60_000) return cached.value;
@@ -186,15 +187,21 @@ export function buildOutlook(db: DB, st: StationRow, horizonHours = 120, history
   const start = Math.floor(now / HOUR) * HOUR;
   const tz = st.tz ?? 'UTC';
 
-  // ---- history / calibration
-  const vrows = loadRows(db, st.icao, historyDays);
+  // ---- history / calibration (independent reads, fetched concurrently)
+  const [vrows, nwsStats, modelStats, climo, tafRow, current] = await Promise.all([
+    loadRows(db, st.icao, historyDays),
+    nwsVerification(db, st.icao, historyDays),
+    modelVerification(db, st.icao, historyDays),
+    climatology(db, st.icao),
+    latestTaf(db, st.icao),
+    latestMetar(db, st.icao),
+  ]);
   const cal: Calibration = calibration(vrows);
   const tafSkill: Record<string, number | null> = {};
   for (const b of LEAD_BUCKETS) {
     const rs = vrows.filter((r) => r.lead_hours >= b.min && r.lead_hours < b.max && r.cat_hit != null);
     tafSkill[b.key] = rs.length >= 30 ? rs.filter((r) => r.cat_hit === 1).length / rs.length : null;
   }
-  const nwsStats = nwsVerification(db, st.icao, historyDays);
   const nwsCal: Record<number, Record<FlightCategory, Probs>> = {};
   const nwsSkill: Record<string, number | null> = {};
   for (let d = 0; d <= 7; d++) {
@@ -202,7 +209,6 @@ export function buildOutlook(db: DB, st: StationRow, horizonHours = 120, history
     nwsCal[d] = calibrateMatrix(s && s.category.n >= 30 ? s.confusion : null);
     nwsSkill[String(d)] = s && s.category.n >= 30 ? s.category.hitRate : null;
   }
-  const modelStats = modelVerification(db, st.icao, historyDays);
   const modelSkill: Record<string, Record<string, number | null>> = {};
   for (const m of MODELS) {
     modelSkill[m] = {};
@@ -211,28 +217,32 @@ export function buildOutlook(db: DB, st: StationRow, horizonHours = 120, history
       modelSkill[m][String(ld)] = s && s.category.n >= 30 ? s.category.hitRate : null;
     }
   }
-  const climo = climatology(db, st.icao);
 
   // ---- current sources
-  const tafRow = latestTaf(db, st.icao);
   const tafHours: Map<number, TafHour> = new Map();
   let tafMeta: Outlook['sources']['taf'] = null;
   if (tafRow && tafRow.valid_to > start) {
     for (const h of JSON.parse(tafRow.hours) as TafHour[]) tafHours.set(h.time, h);
     tafMeta = { issued: tafRow.issued, validFrom: tafRow.valid_from, validTo: tafRow.valid_to, raw: tafRow.raw, amended: !!tafRow.amended };
   }
-  const nwsLatest = db.prepare('SELECT max(issued) i FROM nws_hourly WHERE station=?').get(st.icao) as { i: number | null };
-  const nwsRows = nwsLatest.i
-    ? (db.prepare('SELECT * FROM nws_hourly WHERE station=? AND issued=? ORDER BY valid_time').all(st.icao, nwsLatest.i) as NwsRow[])
+  const nwsLatestRes = await db.from('wxc_nws_hourly').select('issued').eq('station', st.icao).order('issued', { ascending: false }).limit(1).maybeSingle();
+  if (nwsLatestRes.error) throw new DbError(`outlook nws latest: ${nwsLatestRes.error.message}`, nwsLatestRes.error);
+  const nwsIssued = (nwsLatestRes.data as { issued: number } | null)?.issued ?? null;
+  const nwsRows = nwsIssued
+    ? await selectAll<NwsRow>((r0, r1) => db.from('wxc_nws_hourly').select('*').eq('station', st.icao).eq('issued', nwsIssued).order('valid_time').range(r0, r1))
     : [];
   const nwsMap = new Map(nwsRows.map((r) => [r.valid_time, r]));
-  const modelRows = db
-    .prepare('SELECT * FROM model_hourly WHERE station=? AND lead_days=0 AND valid_time>=? AND run_time=(SELECT max(run_time) FROM model_hourly WHERE station=? AND lead_days=0) ORDER BY valid_time')
-    .all(st.icao, start - DAY, st.icao) as ModelRow[];
+  const modelRunRes = await db.from('wxc_model_hourly').select('run_time').eq('station', st.icao).eq('lead_days', 0).order('run_time', { ascending: false }).limit(1).maybeSingle();
+  if (modelRunRes.error) throw new DbError(`outlook model run: ${modelRunRes.error.message}`, modelRunRes.error);
+  const latestRunTime = (modelRunRes.data as { run_time: number } | null)?.run_time ?? null;
+  const modelRows = latestRunTime
+    ? await selectAll<ModelRow>((r0, r1) =>
+        db.from('wxc_model_hourly').select('*').eq('station', st.icao).eq('lead_days', 0).eq('run_time', latestRunTime).gte('valid_time', start - DAY).order('valid_time').range(r0, r1),
+      )
+    : [];
   const modelMap = new Map<string, ModelRow>();
   for (const r of modelRows) modelMap.set(`${r.model}|${r.valid_time}`, r);
-  const recent = db.prepare('SELECT * FROM metars WHERE station=? AND obs_time>=? ORDER BY obs_time').all(st.icao, now - 12 * HOUR) as MetarRow[];
-  const current = latestMetar(db, st.icao);
+  const recent = await selectAll<MetarRow>((r0, r1) => db.from('wxc_metars').select('*').eq('station', st.icao).gte('obs_time', now - 12 * HOUR).order('obs_time').range(r0, r1));
   const currentCat = (current?.category as FlightCategory | null) ?? null;
   const currentAge = current ? (now - current.obs_time) / HOUR : 99;
 
@@ -473,12 +483,12 @@ export function buildOutlook(db: DB, st: StationRow, horizonHours = 120, history
     });
   }
 
-  const trends = computeTrends(db, st, recent, current, hours);
+  const trends = await computeTrends(db, st, recent, current, hours);
   const insights = buildInsights(st, hours, days, trends, vrows.length, tafSkill, nwsSkill, historyDays, cal);
 
   const out: Outlook = {
     station: st.icao, generatedAt: now, horizonHours, tz,
-    sources: { taf: tafMeta, nws: nwsLatest.i ? { issued: nwsLatest.i, office: st.nws_office } : null, models: modelRows.length ? MODELS.map((m) => MODEL_LABEL[m]) : [], climoObsCount: climo.span?.n ?? 0, verificationPairs: vrows.length, historyDays },
+    sources: { taf: tafMeta, nws: nwsIssued ? { issued: nwsIssued, office: st.nws_office } : null, models: modelRows.length ? MODELS.map((m) => MODEL_LABEL[m]) : [], climoObsCount: climo.span?.n ?? 0, verificationPairs: vrows.length, historyDays },
     hours, days, trends, insights, skill: { tafByLead: tafSkill, nwsByLeadDay: nwsSkill, modelByLeadDay: modelSkill },
   };
   outlookCache.set(key, { at: now, value: out });
@@ -494,7 +504,7 @@ function fmtHm(t: number, tz: string): string {
   return new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(t));
 }
 
-function computeTrends(db: DB, st: StationRow, recent: MetarRow[], current: MetarRow | undefined, hours: OutlookHour[]): Trends {
+async function computeTrends(db: DB, st: StationRow, recent: MetarRow[], current: MetarRow | undefined, hours: OutlookHour[]): Promise<Trends> {
   const now = current?.obs_time ?? Date.now();
   const at = (hAgo: number) => {
     const target = now - hAgo * HOUR;
@@ -510,7 +520,9 @@ function computeTrends(db: DB, st: StationRow, recent: MetarRow[], current: Meta
   const seq = hourlyObs(recent).slice(-6).map((r) => (r.category as FlightCategory | null) ?? null);
 
   // TAF drift across the last 3 issuances for hours in the next 24h
-  const tafs = db.prepare('SELECT id, issued, hours FROM tafs WHERE station=? ORDER BY issued DESC LIMIT 3').all(st.icao) as Array<{ id: number; issued: number; hours: string }>;
+  const tafsRes = await db.from('wxc_tafs').select('id,issued,hours').eq('station', st.icao).order('issued', { ascending: false }).limit(3);
+  if (tafsRes.error) throw new DbError(`outlook taf drift: ${tafsRes.error.message}`, tafsRes.error);
+  const tafs = (tafsRes.data ?? []) as Array<{ id: number; issued: number; hours: string }>;
   let drift: Trends['tafDrift'] = { issuances: tafs.length, meanRankChange: null, verdict: 'insufficient', detail: 'Fewer than two TAF issuances available.' };
   if (tafs.length >= 2) {
     const maps = tafs.map((t) => new Map((JSON.parse(t.hours) as TafHour[]).map((h) => [h.time, h])));

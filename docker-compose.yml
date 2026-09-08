@@ -4,14 +4,13 @@ services:
     ports:
       - "8787:8787"
     environment:
+      # Supabase project used as the data store (see supabase/schema.sql). Required.
+      SUPABASE_URL: "https://your-project.supabase.co"
+      SUPABASE_ANON_KEY: "your-anon-key"
       # Comma-separated ICAO identifiers added on first boot
       DEFAULT_STATIONS: "KTEB,KHPN,KVNY"
       # Days of METAR/TAF history pulled from the IEM archive per station
       BACKFILL_DAYS: "120"
       # NWS asks for a descriptive User-Agent with contact info
       WX_USER_AGENT: "wx-compare/0.1 (your-email@example.com)"
-    volumes:
-      - wxdata:/data
     restart: unless-stopped
-volumes:
-  wxdata:

@@ -5,7 +5,6 @@ const env = process.env;
 export const config = {
   port: parseInt(env.PORT ?? '8787', 10),
   host: env.HOST ?? '0.0.0.0',
-  dataDir: env.DATA_DIR ?? path.resolve(process.cwd(), '..', 'data'),
   /** NWS requires a descriptive User-Agent with contact info. */
   userAgent: env.WX_USER_AGENT ?? 'wx-compare/0.1 (aviation forecast verification; contact via repo)',
   /** Days of METAR/TAF history pulled from the IEM archive when a station is added. */
