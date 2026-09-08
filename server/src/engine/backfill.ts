@@ -2,11 +2,12 @@
  * Station registration and historical backfill from the IEM archive.
  */
 import type { DB } from '../db/index.js';
+import { DbError } from '../db/index.js';
 import { config } from '../config.js';
 import * as awc from '../sources/awc.js';
 import * as nws from '../sources/nws.js';
 import * as iem from '../sources/iem.js';
-import { getStation, insertMetar, insertTaf, log, type StationRow } from './store.js';
+import { getStation, insertMetarsBatch, insertTafsBatch, log, type StationRow } from './store.js';
 import { verifyStation } from './verify.js';
 import { pollModels, pollNws } from './ingest.js';
 
@@ -15,7 +16,7 @@ const DAY = 86_400_000;
 export async function registerStation(db: DB, icaoIn: string): Promise<StationRow> {
   const icao = icaoIn.trim().toUpperCase();
   if (!/^[A-Z0-9]{4}$/.test(icao)) throw new Error('ICAO identifier must be 4 characters (e.g. KTEB)');
-  const existing = getStation(db, icao);
+  const existing = await getStation(db, icao);
   if (existing) return existing;
   const info = (await awc.fetchStationInfo([icao]))[0];
   if (!info) throw new Error(`Station ${icao} not found in aviationweather.gov station table`);
@@ -27,19 +28,22 @@ export async function registerStation(db: DB, icaoIn: string): Promise<StationRo
       point = null;
     }
   }
-  db.prepare(
-    `INSERT INTO stations(icao, name, lat, lon, elev_ft, state, country, tz, iata, faa, has_taf, nws_office, nws_grid_id, nws_grid_x, nws_grid_y, nws_radar, added_at, backfill_days, backfill_status)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending')`,
-  ).run(
-    icao, info.site, info.lat, info.lon, info.elev == null ? null : Math.round(info.elev * 3.28084), info.state ?? null, info.country ?? null, point?.timeZone ?? null,
-    info.iataId ?? null, info.faaId ?? null, info.siteType?.includes('TAF') ? 1 : 0, point?.forecastOffice ?? null, point?.gridId ?? null, point?.gridX ?? null, point?.gridY ?? null,
-    point?.radarStation ?? null, Date.now(), config.backfillDays,
-  );
-  return getStation(db, icao)!;
+  const res = await db.from('wxc_stations').insert({
+    icao, name: info.site, lat: info.lat, lon: info.lon, elev_ft: info.elev == null ? null : Math.round(info.elev * 3.28084),
+    state: info.state ?? null, country: info.country ?? null, tz: point?.timeZone ?? null, iata: info.iataId ?? null, faa: info.faaId ?? null,
+    has_taf: info.siteType?.includes('TAF') ? 1 : 0, nws_office: point?.forecastOffice ?? null, nws_grid_id: point?.gridId ?? null,
+    nws_grid_x: point?.gridX ?? null, nws_grid_y: point?.gridY ?? null, nws_radar: point?.radarStation ?? null, added_at: Date.now(),
+    backfill_days: config.backfillDays, backfill_status: 'pending',
+  });
+  if (res.error) throw new DbError(`registerStation: ${res.error.message}`, res.error);
+  return (await getStation(db, icao))!;
 }
 
-function setStatus(db: DB, icao: string, status: string, message: string) {
-  db.prepare('UPDATE stations SET backfill_status=?, backfill_message=?, backfill_done_at=CASE WHEN ?=\'done\' THEN ? ELSE backfill_done_at END WHERE icao=?').run(status, message, status, Date.now(), icao);
+async function setStatus(db: DB, icao: string, status: string, message: string): Promise<void> {
+  const patch: Record<string, unknown> = { backfill_status: status, backfill_message: message };
+  if (status === 'done') patch.backfill_done_at = Date.now();
+  const res = await db.from('wxc_stations').update(patch).eq('icao', icao);
+  if (res.error) throw new DbError(`setStatus: ${res.error.message}`, res.error);
 }
 
 const running = new Set<string>();
@@ -48,7 +52,7 @@ const running = new Set<string>();
 export async function backfillStation(db: DB, icao: string, days = config.backfillDays): Promise<void> {
   if (running.has(icao)) return;
   running.add(icao);
-  const st = getStation(db, icao);
+  const st = await getStation(db, icao);
   if (!st) {
     running.delete(icao);
     return;
@@ -56,49 +60,35 @@ export async function backfillStation(db: DB, icao: string, days = config.backfi
   const end = new Date(Date.now() + DAY);
   const start = new Date(Date.now() - days * DAY);
   try {
-    setStatus(db, icao, 'running', `Fetching ${days} days of METARs from IEM archive…`);
+    await setStatus(db, icao, 'running', `Fetching ${days} days of METARs from IEM archive…`);
     const metars = await iem.fetchMetarArchive(icao, start, end);
-    let nM = 0;
-    let warn = 0;
-    const tx = db.transaction(() => {
-      for (const r of metars) {
-        const res = insertMetar(db, icao, r.raw, new Date(r.validUtc), 'iem');
-        if (res.inserted) nM++;
-        if (res.metar.parseWarnings.length) warn++;
-      }
-    });
-    tx();
-    log(db, 'iem.metar', icao, true, `${metars.length} rows, ${nM} new, ${warn} with parse warnings`, nM);
+    const mRes = await insertMetarsBatch(db, icao, metars.map((r) => ({ raw: r.raw, reference: new Date(r.validUtc) })), 'iem');
+    await log(db, 'iem.metar', icao, true, `${mRes.total} rows, ${mRes.inserted} new, ${mRes.warnings} with parse warnings`, mRes.inserted);
 
     let nT = 0;
     if (st.has_taf) {
-      setStatus(db, icao, 'running', `METARs done (${nM}). Fetching TAF archive…`);
-      // monthly chunks to keep responses small
+      await setStatus(db, icao, 'running', `METARs done (${mRes.inserted}). Fetching TAF archive…`);
+      // monthly chunks to keep archive responses small
       let chunkStart = start;
       while (chunkStart < end) {
         const chunkEnd = new Date(Math.min(end.getTime(), chunkStart.getTime() + 31 * DAY));
         const tafs = await iem.fetchTafArchive(icao, chunkStart, chunkEnd);
-        const txT = db.transaction(() => {
-          for (const t of tafs) {
-            const res = insertTaf(db, icao, t.raw, new Date(t.issued), 'iem');
-            if (res.inserted) nT++;
-          }
-        });
-        txT();
+        const tRes = await insertTafsBatch(db, icao, tafs.map((t) => ({ raw: t.raw, reference: new Date(t.issued) })), 'iem');
+        nT += tRes.inserted;
         chunkStart = chunkEnd;
       }
-      log(db, 'iem.taf', icao, true, `${nT} new TAFs`, nT);
+      await log(db, 'iem.taf', icao, true, `${nT} new TAFs`, nT);
     }
-    setStatus(db, icao, 'running', `Verifying ${nM} obs × TAFs…`);
-    const nV = verifyStation(db, icao, start.getTime(), end.getTime());
-    log(db, 'verify', icao, true, `${nV} verification rows`, nV);
-    setStatus(db, icao, 'running', 'Fetching NWS forecast and model guidance…');
+    await setStatus(db, icao, 'running', `Verifying ${mRes.inserted} obs × TAFs…`);
+    const nV = await verifyStation(db, icao, start.getTime(), end.getTime());
+    await log(db, 'verify', icao, true, `${nV} verification rows`, nV);
+    await setStatus(db, icao, 'running', 'Fetching NWS forecast and model guidance…');
     await pollNws(db, st);
     await pollModels(db, st, true);
-    setStatus(db, icao, 'done', `${nM} METARs, ${nT} TAFs, ${nV} verification pairs over ${days} days`);
+    await setStatus(db, icao, 'done', `${mRes.inserted} METARs, ${nT} TAFs, ${nV} verification pairs over ${days} days`);
   } catch (e) {
-    setStatus(db, icao, 'error', String(e));
-    log(db, 'backfill', icao, false, String(e));
+    await setStatus(db, icao, 'error', String(e));
+    await log(db, 'backfill', icao, false, String(e));
   } finally {
     running.delete(icao);
   }

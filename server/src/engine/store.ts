@@ -1,4 +1,5 @@
 import type { DB } from '../db/index.js';
+import { DbError, upsertChunked } from '../db/index.js';
 import { parseMetar } from '../wx/metar.js';
 import { expandTaf, parseTaf } from '../wx/taf.js';
 import type { Metar, Taf, TafHour } from '../wx/types.js';
@@ -35,47 +36,95 @@ export interface StationRow {
   enabled: number;
 }
 
-export function listStations(db: DB, enabledOnly = false): StationRow[] {
-  return db.prepare(`SELECT * FROM stations ${enabledOnly ? 'WHERE enabled=1' : ''} ORDER BY icao`).all() as StationRow[];
+export async function listStations(db: DB, enabledOnly = false): Promise<StationRow[]> {
+  let q = db.from('wxc_stations').select('*').order('icao');
+  if (enabledOnly) q = q.eq('enabled', 1);
+  const res = await q;
+  if (res.error) throw new DbError(`listStations: ${res.error.message}`, res.error);
+  return (res.data ?? []) as StationRow[];
 }
 
-export function getStation(db: DB, icao: string): StationRow | undefined {
-  return db.prepare('SELECT * FROM stations WHERE icao=?').get(icao) as StationRow | undefined;
+export async function getStation(db: DB, icao: string): Promise<StationRow | undefined> {
+  const res = await db.from('wxc_stations').select('*').eq('icao', icao).maybeSingle();
+  if (res.error) throw new DbError(`getStation: ${res.error.message}`, res.error);
+  return (res.data as StationRow) ?? undefined;
 }
 
-export function log(db: DB, source: string, station: string | null, ok: boolean, message: string, count?: number) {
-  db.prepare('INSERT INTO ingest_log(at, source, station, ok, message, count) VALUES (?,?,?,?,?,?)').run(Date.now(), source, station, ok ? 1 : 0, message.slice(0, 500), count ?? null);
-  if (Math.random() < 0.01) db.prepare('DELETE FROM ingest_log WHERE id < (SELECT MAX(id) FROM ingest_log) - 5000').run();
+export async function log(db: DB, source: string, station: string | null, ok: boolean, message: string, count?: number): Promise<void> {
+  const res = await db.from('wxc_ingest_log').insert({ at: Date.now(), source, station, ok: ok ? 1 : 0, message: message.slice(0, 500), count: count ?? null });
+  if (res.error) throw new DbError(`log: ${res.error.message}`, res.error);
+  // Keep the log bounded; cheap best-effort prune, failure here must never break ingestion.
+  if (Math.random() < 0.01) {
+    try {
+      const latest = await db.from('wxc_ingest_log').select('id').order('id', { ascending: false }).range(5000, 5000).maybeSingle();
+      if (latest.data) await db.from('wxc_ingest_log').delete().lt('id', (latest.data as { id: number }).id);
+    } catch {
+      /* best-effort */
+    }
+  }
 }
 
-/** Insert a raw METAR; returns the decoded METAR and whether it was new. */
-export function insertMetar(db: DB, station: string, raw: string, reference: Date, source: string, typeHint?: 'METAR' | 'SPECI'): { metar: Metar; inserted: boolean; id: number | null } {
+/** Decode a raw METAR and upsert it. `inserted` is true only when the row was newly written. */
+export async function insertMetar(
+  db: DB,
+  station: string,
+  raw: string,
+  reference: Date,
+  source: string,
+  typeHint?: 'METAR' | 'SPECI',
+): Promise<{ metar: Metar; inserted: boolean; id: number | null }> {
   const m = parseMetar(raw, reference);
   if (typeHint && !/^(METAR|SPECI)\s/.test(raw)) m.type = typeHint;
   if (m.nil || !m.station) return { metar: m, inserted: false, id: null };
   const wx = JSON.stringify(m.cond.weather.map((w) => w.raw));
   const clouds = JSON.stringify(m.cond.clouds);
-  const res = db
-    .prepare(
-      `INSERT OR IGNORE INTO metars(station, obs_time, hour_time, type, raw, ceiling_ft, vis_sm, category, wind_dir, wind_var, wind_spd, wind_gust, temp_c, dewp_c, altim_inhg, slp_hpa, wx, clouds, decoded, source)
-       VALUES (@station,@obs_time,@hour_time,@type,@raw,@ceiling_ft,@vis_sm,@category,@wind_dir,@wind_var,@wind_spd,@wind_gust,@temp_c,@dewp_c,@altim_inhg,@slp_hpa,@wx,@clouds,@decoded,@source)`,
-    )
-    .run({
-      station, obs_time: m.time, hour_time: hourOf(m.time), type: m.type, raw: m.raw, ceiling_ft: m.ceilingFt, vis_sm: visValue(m.cond.visibility), category: m.category,
-      wind_dir: m.cond.wind?.dirDeg ?? null, wind_var: m.cond.wind?.variable ? 1 : 0, wind_spd: m.cond.wind?.speedKt ?? null, wind_gust: m.cond.wind?.gustKt ?? null,
-      temp_c: m.tempC, dewp_c: m.dewpC, altim_inhg: m.altimeterInHg, slp_hpa: m.remarks.slpHpa, wx, clouds, decoded: JSON.stringify(m), source,
-    });
-  return { metar: m, inserted: res.changes > 0, id: res.changes > 0 ? Number(res.lastInsertRowid) : null };
+  const row = {
+    station,
+    obs_time: m.time,
+    hour_time: hourOf(m.time),
+    type: m.type,
+    raw: m.raw,
+    ceiling_ft: m.ceilingFt,
+    vis_sm: visValue(m.cond.visibility),
+    category: m.category,
+    wind_dir: m.cond.wind?.dirDeg ?? null,
+    wind_var: m.cond.wind?.variable ? 1 : 0,
+    wind_spd: m.cond.wind?.speedKt ?? null,
+    wind_gust: m.cond.wind?.gustKt ?? null,
+    temp_c: m.tempC,
+    dewp_c: m.dewpC,
+    altim_inhg: m.altimeterInHg,
+    slp_hpa: m.remarks.slpHpa,
+    wx,
+    clouds,
+    decoded: JSON.stringify(m),
+    source,
+  };
+  const res = await db.from('wxc_metars').upsert(row, { onConflict: 'station,obs_time,raw', ignoreDuplicates: true }).select('id');
+  if (res.error) throw new DbError(`insertMetar: ${res.error.message}`, res.error);
+  const inserted = (res.data?.length ?? 0) > 0;
+  return { metar: m, inserted, id: inserted ? (res.data![0] as { id: number }).id : null };
 }
 
-export function insertTaf(db: DB, station: string, raw: string, reference: Date, source: string): { taf: Taf; inserted: boolean; id: number | null } {
+export async function insertTaf(db: DB, station: string, raw: string, reference: Date, source: string): Promise<{ taf: Taf; inserted: boolean; id: number | null }> {
   const taf = parseTaf(raw, reference);
   if (taf.nil || !taf.station) return { taf, inserted: false, id: null };
   const hours = expandTaf(taf);
-  const res = db
-    .prepare(`INSERT OR IGNORE INTO tafs(station, issued, valid_from, valid_to, amended, raw, decoded, hours, source) VALUES (?,?,?,?,?,?,?,?,?)`)
-    .run(station, taf.issued, taf.validFrom, taf.validTo, taf.amended ? 1 : 0, taf.raw, JSON.stringify(taf), JSON.stringify(hours), source);
-  return { taf, inserted: res.changes > 0, id: res.changes > 0 ? Number(res.lastInsertRowid) : null };
+  const row = {
+    station,
+    issued: taf.issued,
+    valid_from: taf.validFrom,
+    valid_to: taf.validTo,
+    amended: taf.amended ? 1 : 0,
+    raw: taf.raw,
+    decoded: JSON.stringify(taf),
+    hours: JSON.stringify(hours),
+    source,
+  };
+  const res = await db.from('wxc_tafs').upsert(row, { onConflict: 'station,issued,raw', ignoreDuplicates: true }).select('id');
+  if (res.error) throw new DbError(`insertTaf: ${res.error.message}`, res.error);
+  const inserted = (res.data?.length ?? 0) > 0;
+  return { taf, inserted, id: inserted ? (res.data![0] as { id: number }).id : null };
 }
 
 export interface TafRow {
@@ -119,18 +168,80 @@ export interface MetarRow {
   source: string;
 }
 
-export function latestMetar(db: DB, station: string): MetarRow | undefined {
-  return db.prepare('SELECT * FROM metars WHERE station=? ORDER BY obs_time DESC LIMIT 1').get(station) as MetarRow | undefined;
+export async function latestMetar(db: DB, station: string): Promise<MetarRow | undefined> {
+  const res = await db.from('wxc_metars').select('*').eq('station', station).order('obs_time', { ascending: false }).limit(1).maybeSingle();
+  if (res.error) throw new DbError(`latestMetar: ${res.error.message}`, res.error);
+  return (res.data as MetarRow) ?? undefined;
 }
 
-export function latestTaf(db: DB, station: string): TafRow | undefined {
-  return db.prepare('SELECT * FROM tafs WHERE station=? ORDER BY issued DESC LIMIT 1').get(station) as TafRow | undefined;
+export async function latestTaf(db: DB, station: string): Promise<TafRow | undefined> {
+  const res = await db.from('wxc_tafs').select('*').eq('station', station).order('issued', { ascending: false }).limit(1).maybeSingle();
+  if (res.error) throw new DbError(`latestTaf: ${res.error.message}`, res.error);
+  return (res.data as TafRow) ?? undefined;
 }
 
-export function getSetting(db: DB, key: string): string | null {
-  const r = db.prepare('SELECT value FROM settings WHERE key=?').get(key) as { value: string } | undefined;
-  return r?.value ?? null;
+export async function getSetting(db: DB, key: string): Promise<string | null> {
+  const res = await db.from('wxc_settings').select('value').eq('key', key).maybeSingle();
+  if (res.error) throw new DbError(`getSetting: ${res.error.message}`, res.error);
+  return (res.data as { value: string } | null)?.value ?? null;
 }
-export function setSetting(db: DB, key: string, value: string) {
-  db.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, value);
+export async function setSetting(db: DB, key: string, value: string): Promise<void> {
+  const res = await db.from('wxc_settings').upsert({ key, value }, { onConflict: 'key' });
+  if (res.error) throw new DbError(`setSetting: ${res.error.message}`, res.error);
 }
+
+
+/**
+ * Decode and upsert many raw METARs for one station in a single batched request (used by
+ * backfill, which can have thousands of rows). Returns how many were newly inserted and how
+ * many had parser warnings (for a quick data-quality signal in the ingest log).
+ */
+export async function insertMetarsBatch(db: DB, station: string, items: Array<{ raw: string; reference: Date }>, source: string): Promise<{ inserted: number; warnings: number; total: number }> {
+  const decoded = items.map((it) => parseMetar(it.raw, it.reference)).filter((m) => !m.nil && m.station);
+  const warnings = decoded.filter((m) => m.parseWarnings.length).length;
+  const rows = decoded.map((m) => ({
+    station,
+    obs_time: m.time,
+    hour_time: hourOf(m.time),
+    type: m.type,
+    raw: m.raw,
+    ceiling_ft: m.ceilingFt,
+    vis_sm: visValue(m.cond.visibility),
+    category: m.category,
+    wind_dir: m.cond.wind?.dirDeg ?? null,
+    wind_var: m.cond.wind?.variable ? 1 : 0,
+    wind_spd: m.cond.wind?.speedKt ?? null,
+    wind_gust: m.cond.wind?.gustKt ?? null,
+    temp_c: m.tempC,
+    dewp_c: m.dewpC,
+    altim_inhg: m.altimeterInHg,
+    slp_hpa: m.remarks.slpHpa,
+    wx: JSON.stringify(m.cond.weather.map((w) => w.raw)),
+    clouds: JSON.stringify(m.cond.clouds),
+    decoded: JSON.stringify(m),
+    source,
+  }));
+  const written = await upsertChunked(db, 'wxc_metars', rows, 'station,obs_time,raw', { ignoreDuplicates: true, select: 'id' });
+  return { inserted: written.length, warnings, total: items.length };
+}
+
+/** Decode and upsert many raw TAFs for one station in a single batched request. */
+export async function insertTafsBatch(db: DB, station: string, items: Array<{ raw: string; reference: Date }>, source: string): Promise<{ inserted: number; total: number }> {
+  const decoded = items.map((it) => ({ taf: parseTaf(it.raw, it.reference) })).filter((d) => !d.taf.nil && d.taf.station);
+  const rows = decoded.map(({ taf }) => ({
+    station,
+    issued: taf.issued,
+    valid_from: taf.validFrom,
+    valid_to: taf.validTo,
+    amended: taf.amended ? 1 : 0,
+    raw: taf.raw,
+    decoded: JSON.stringify(taf),
+    hours: JSON.stringify(expandTaf(taf)),
+    source,
+  }));
+  const written = await upsertChunked(db, 'wxc_tafs', rows, 'station,issued,raw', { ignoreDuplicates: true, select: 'id' });
+  return { inserted: written.length, total: items.length };
+}
+
+/** Re-exported for callers that batch-write many rows at once (ingest.ts, backfill.ts). */
+export { upsertChunked };

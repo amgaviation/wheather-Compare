@@ -1,0 +1,20 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "buildCommand": "npm run build",
+  "outputDirectory": "web/dist",
+  "installCommand": "npm install",
+  "functions": {
+    "api/[...path].ts": { "maxDuration": 300 },
+    "api/cron/metar.ts": { "maxDuration": 60 },
+    "api/cron/taf.ts": { "maxDuration": 60 },
+    "api/cron/nws.ts": { "maxDuration": 120 },
+    "api/cron/models.ts": { "maxDuration": 200 }
+  },
+  "crons": [
+    { "path": "/api/cron/metar", "schedule": "*/5 * * * *" },
+    { "path": "/api/cron/taf", "schedule": "*/10 * * * *" },
+    { "path": "/api/cron/nws", "schedule": "0 * * * *" },
+    { "path": "/api/cron/models", "schedule": "0 */3 * * *" }
+  ]
+}

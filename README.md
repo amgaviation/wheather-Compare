@@ -41,32 +41,77 @@ For every hour out to the chosen horizon the engine collects: the TAF hour (with
 
 It is a statistical aid, not an official forecast.
 
-## Run it
+## Data store
 
-Requirements: Node 22+.
+The app is stateless application code in front of a Postgres database reached over
+[Supabase](https://supabase.com)'s PostgREST HTTPS API — not a direct Postgres connection.
+That is what lets the same code run either as one long-lived Node process (Docker, a VPS, a
+laptop) or as short-lived Vercel serverless functions, without a connection pool to exhaust
+across many concurrent Lambda instances.
+
+1. Create a Supabase project (or reuse one — tables are prefixed `wxc_` and RLS-scoped so they
+   won't collide with anything else already in it).
+2. Run `supabase/schema.sql` against it once (Supabase Studio → SQL Editor, or
+   `psql "$DATABASE_URL" -f supabase/schema.sql`).
+3. Set `SUPABASE_URL` and `SUPABASE_ANON_KEY` (Project Settings → API) wherever the app runs.
+   This key is a server-side secret in this app — the anon-role RLS policy grants it full
+   access to the `wxc_*` tables, and it must never reach a browser. The frontend only ever
+   talks to this app's own API, never to Supabase directly.
+
+## Deploy to Vercel
+
+```bash
+vercel link          # or: vercel deploy for a one-off
+vercel env add SUPABASE_URL
+vercel env add SUPABASE_ANON_KEY
+vercel env add CRON_SECRET        # any random string; gates api/cron/*
+vercel deploy --prod
+```
+
+`vercel.json` builds the web app as the static output and the API as one catch-all serverless
+function (`api/[...path].ts`, reusing the same Fastify app as the standalone server). Four
+`api/cron/*.ts` endpoints replace the standalone server's `setInterval` scheduler — Vercel Cron
+calls them on the schedules in `vercel.json` (METARs every 5 min, TAFs every 10 min, NWS
+hourly, models every 3 h) — and are protected by `CRON_SECRET`: Vercel automatically sends it
+as a bearer token when it invokes a Cron Job itself, once that env var is set on the project.
+
+Unlike the standalone server, nothing auto-registers `DEFAULT_STATIONS` on a cold start (that
+would re-trigger on every new Lambda instance). After the first deploy, add each airport once
+from the Stations & Data page — its backfill runs via `waitUntil`, so the request returns
+immediately while history keeps loading in the background.
+
+## Run it standalone (Docker, VPS, local dev)
+
+Requirements: Node 22+, plus a Supabase project as above.
 
 ```bash
 npm install
-npm run dev          # API on :8787, Vite UI on :5173 (proxies /api)
+SUPABASE_URL=... SUPABASE_ANON_KEY=... npm run dev   # API on :8787, Vite UI on :5173 (proxies /api)
 ```
 
 Production build and run (UI served by the API server):
 
 ```bash
 npm run build
-DEFAULT_STATIONS=KTEB,KHPN BACKFILL_DAYS=120 npm start
+SUPABASE_URL=... SUPABASE_ANON_KEY=... DEFAULT_STATIONS=KTEB,KHPN BACKFILL_DAYS=120 npm start
 # open http://localhost:8787
 ```
 
 Docker:
 
 ```bash
-docker compose up --build
+docker compose up --build   # set SUPABASE_URL / SUPABASE_ANON_KEY in docker-compose.yml first
 ```
 
-Environment variables: `PORT` (8787), `DATA_DIR` (SQLite location, `./data`), `DEFAULT_STATIONS` (added on first boot), `BACKFILL_DAYS` (120), `USE_OPEN_METEO` (true), `WX_USER_AGENT`.
+Environment variables: `PORT` (8787), `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `DEFAULT_STATIONS`
+(added on first boot — standalone mode only), `BACKFILL_DAYS` (120), `USE_OPEN_METEO` (true),
+`WX_USER_AGENT`, `CRON_SECRET` (Vercel only).
 
-On first boot the default stations are registered and backfilled (about 10–30 s per station for 120 days). Live polling: METARs every 5 min, TAFs every 10 min, NWS hourly, models every 3 h. NWS and model verification statistics accrue from the moment a station is added (model "previous run" data gives an immediate 7-day baseline).
+On first boot (standalone mode) the default stations are registered and backfilled (about
+15–30 s per station for 120 days). Live polling: METARs every 5 min, TAFs every 10 min, NWS
+hourly, models every 3 h — via an in-process scheduler standalone, via Vercel Cron on Vercel.
+NWS and model verification statistics accrue from the moment a station is added (model
+"previous run" data gives an immediate 7-day baseline).
 
 ## Tests
 

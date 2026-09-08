@@ -3,6 +3,7 @@
  * (calibration) tables, diurnal behaviour, busts, amendments, NWS and model verification.
  */
 import type { DB } from '../db/index.js';
+import { DbError, selectAll } from '../db/index.js';
 import { CATEGORY_ORDER, CATEGORY_RANK, type FlightCategory } from '../wx/types.js';
 import { CEILING_CAP, VIS_CAP, angleDiff } from './verify.js';
 
@@ -57,11 +58,11 @@ export interface VRow {
   taf_id: number;
 }
 
-export function loadRows(db: DB, station: string, days: number): VRow[] {
+export async function loadRows(db: DB, station: string, days: number): Promise<VRow[]> {
   const since = Date.now() - days * DAY;
-  return db
-    .prepare('SELECT * FROM taf_verification WHERE station=? AND hour_time>=? ORDER BY hour_time')
-    .all(station, since) as VRow[];
+  return selectAll<VRow>((r0, r1) =>
+    db.from('wxc_taf_verification').select('*').eq('station', station).gte('hour_time', since).order('hour_time').range(r0, r1),
+  );
 }
 
 const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
@@ -325,25 +326,36 @@ export interface Bust {
   kind: 'unforecast deterioration' | 'over-forecast' | 'category miss';
 }
 
-export function busts(db: DB, rows: VRow[], limit = 40): Bust[] {
+export async function busts(db: DB, rows: VRow[], limit = 40): Promise<Bust[]> {
   const cand = rows
     .filter((r) => r.operative && r.fcst_cat && r.obs_cat && Math.abs(r.cat_err ?? 0) >= 1)
     .map((r) => ({ r, score: Math.abs(r.cat_err ?? 0) * 10 + (r.tempo_covered ? -5 : 0) + (CATEGORY_RANK[r.obs_cat!] >= 2 ? 3 : 0) }))
     .sort((a, b) => b.score - a.score || b.r.hour_time - a.r.hour_time)
     .slice(0, limit);
-  const mStmt = db.prepare('SELECT raw FROM metars WHERE id=?');
-  const tStmt = db.prepare('SELECT raw FROM tafs WHERE id=?');
+  if (!cand.length) return [];
+  const metarIds = [...new Set(cand.map((c) => c.r.metar_id))];
+  const tafIds = [...new Set(cand.map((c) => c.r.taf_id))];
+  const [mRes, tRes] = await Promise.all([
+    db.from('wxc_metars').select('id,raw').in('id', metarIds),
+    db.from('wxc_tafs').select('id,raw').in('id', tafIds),
+  ]);
+  if (mRes.error) throw new DbError(`busts metars: ${mRes.error.message}`, mRes.error);
+  if (tRes.error) throw new DbError(`busts tafs: ${tRes.error.message}`, tRes.error);
+  const mMap = new Map(((mRes.data ?? []) as Array<{ id: number; raw: string }>).map((x) => [x.id, x.raw]));
+  const tMap = new Map(((tRes.data ?? []) as Array<{ id: number; raw: string }>).map((x) => [x.id, x.raw]));
   return cand.map(({ r }) => ({
     hourTime: r.hour_time, leadHours: r.lead_hours, fcstCat: r.fcst_cat!, obsCat: r.obs_cat!, worstCat: r.worst_cat,
     fcstCeiling: r.fcst_ceiling, obsCeiling: r.obs_ceiling, fcstVis: r.fcst_vis, obsVis: r.obs_vis,
-    metarRaw: (mStmt.get(r.metar_id) as { raw: string } | undefined)?.raw ?? '', tafRaw: (tStmt.get(r.taf_id) as { raw: string } | undefined)?.raw ?? '', tafIssued: r.taf_issued,
+    metarRaw: mMap.get(r.metar_id) ?? '', tafRaw: tMap.get(r.taf_id) ?? '', tafIssued: r.taf_issued,
     kind: (r.cat_err ?? 0) > 0 ? (r.tempo_covered ? 'category miss' : 'unforecast deterioration') : 'over-forecast',
   }));
 }
 
-export function amendmentStats(db: DB, station: string, days: number) {
+export async function amendmentStats(db: DB, station: string, days: number) {
   const since = Date.now() - days * DAY;
-  const tafs = db.prepare('SELECT issued, amended, valid_from, valid_to FROM tafs WHERE station=? AND issued>=? ORDER BY issued').all(station, since) as Array<{ issued: number; amended: number; valid_from: number; valid_to: number }>;
+  const tafs = await selectAll<{ issued: number; amended: number; valid_from: number; valid_to: number }>((r0, r1) =>
+    db.from('wxc_tafs').select('issued,amended,valid_from,valid_to').eq('station', station).gte('issued', since).order('issued').range(r0, r1),
+  );
   const total = tafs.length;
   const amended = tafs.filter((t) => t.amended).length;
   const gaps: number[] = [];
@@ -355,29 +367,34 @@ export function amendmentStats(db: DB, station: string, days: number) {
 }
 
 /** Observation-only climatology: category frequency by month and UTC hour. */
-export function climatology(db: DB, station: string) {
-  const rows = db
-    .prepare(`SELECT strftime('%m', obs_time/1000, 'unixepoch') AS mo, strftime('%H', obs_time/1000, 'unixepoch') AS hr, category, count(*) n FROM metars WHERE station=? AND type='METAR' AND category IS NOT NULL GROUP BY 1,2,3`)
-    .all(station) as Array<{ mo: string; hr: string; category: FlightCategory; n: number }>;
+export async function climatology(db: DB, station: string) {
+  const rows = await selectAll<{ obs_time: number; category: FlightCategory }>((r0, r1) =>
+    db.from('wxc_metars').select('obs_time,category').eq('station', station).eq('type', 'METAR').not('category', 'is', null).range(r0, r1),
+  );
   const table: Record<string, Record<string, Record<FlightCategory, number>>> = {};
-  for (const r of rows) {
-    table[r.mo] ??= {};
-    table[r.mo][r.hr] ??= { VFR: 0, MVFR: 0, IFR: 0, LIFR: 0 };
-    table[r.mo][r.hr][r.category] += r.n;
-  }
   const byHour: Record<string, Record<string, Record<FlightCategory, number>>> = { all: {} };
   for (const r of rows) {
-    byHour.all[r.hr] ??= { VFR: 0, MVFR: 0, IFR: 0, LIFR: 0 };
-    byHour.all[r.hr][r.category] += r.n;
+    const d = new Date(r.obs_time);
+    const mo = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const hr = String(d.getUTCHours()).padStart(2, '0');
+    table[mo] ??= {};
+    table[mo][hr] ??= { VFR: 0, MVFR: 0, IFR: 0, LIFR: 0 };
+    table[mo][hr][r.category]++;
+    byHour.all[hr] ??= { VFR: 0, MVFR: 0, IFR: 0, LIFR: 0 };
+    byHour.all[hr][r.category]++;
   }
-  const overall = db
-    .prepare(`SELECT category, count(*) n FROM metars WHERE station=? AND type='METAR' AND category IS NOT NULL GROUP BY 1`)
-    .all(station) as Array<{ category: FlightCategory; n: number }>;
-  const span = db.prepare('SELECT min(obs_time) a, max(obs_time) b, count(*) n FROM metars WHERE station=?').get(station) as { a: number; b: number; n: number };
-  return { byMonthHour: table, byHour, overall: Object.fromEntries(overall.map((o) => [o.category, o.n])), span };
+  const overall: Record<string, number> = { VFR: 0, MVFR: 0, IFR: 0, LIFR: 0 };
+  for (const r of rows) overall[r.category]++;
+  let a = Infinity, b = -Infinity;
+  for (const r of rows) {
+    if (r.obs_time < a) a = r.obs_time;
+    if (r.obs_time > b) b = r.obs_time;
+  }
+  const span = rows.length ? { a, b, n: rows.length } : { a: 0, b: 0, n: 0 };
+  return { byMonthHour: table, byHour, overall, span };
 }
 
-export function climoProbs(table: ReturnType<typeof climatology>['byMonthHour'], month: number, hourUtc: number, minN = 5): Record<FlightCategory, number> | null {
+export function climoProbs(table: Awaited<ReturnType<typeof climatology>>['byMonthHour'], month: number, hourUtc: number, minN = 5): Record<FlightCategory, number> | null {
   const mo = month === 0 ? 'all' : String(month).padStart(2, '0');
   const hr = String(hourUtc).padStart(2, '0');
   const cell = table[mo]?.[hr];
@@ -421,26 +438,64 @@ export interface NwsLeadStats {
   confusion: number[][];
 }
 
+interface ObsForJoin {
+  hour_time: number;
+  temp_c: number | null;
+  dewp_c: number | null;
+  wind_dir: number | null;
+  wind_var: number;
+  wind_spd: number | null;
+  clouds: string;
+  category: FlightCategory | null;
+  ceiling_ft: number | null;
+}
+
+async function loadObsForJoin(db: DB, station: string, since: number, until: number): Promise<Map<number, ObsForJoin>> {
+  const rows = await selectAll<ObsForJoin>((r0, r1) =>
+    db
+      .from('wxc_metars')
+      .select('hour_time,temp_c,dewp_c,wind_dir,wind_var,wind_spd,clouds,category,ceiling_ft')
+      .eq('station', station)
+      .eq('type', 'METAR')
+      .gte('hour_time', since)
+      .lt('hour_time', until)
+      .range(r0, r1),
+  );
+  // one obs per hour: the fluent select has no dedup key issue here since (station,type='METAR',hour_time)
+  // is not unique at the DB level (a station can log more than one METAR in the same hour in rare cases);
+  // prefer the first encountered, matching the original "SELECT ... JOIN" which took whichever the join
+  // produced first for a given hour (join is 1:1 keyed on hour_time in the overwhelming common case).
+  const map = new Map<number, ObsForJoin>();
+  for (const r of rows) if (!map.has(r.hour_time)) map.set(r.hour_time, r);
+  return map;
+}
+
 /** NWS gridpoint hourly forecast verified against observations, by lead day. */
-export function nwsVerification(db: DB, station: string, days: number): NwsLeadStats[] {
+export async function nwsVerification(db: DB, station: string, days: number): Promise<NwsLeadStats[]> {
   const since = Date.now() - days * DAY;
-  const rows = db
-    .prepare(
-      `SELECT f.issued, f.valid_time, f.temp_c ft, f.dewp_c fd, f.wind_dir fwd, f.wind_spd fws, f.sky_pct fsky, f.ceiling_ft fc, f.vis_sm fv,
-              m.temp_c ot, m.dewp_c od, m.wind_dir owd, m.wind_var owv, m.wind_spd ows, m.clouds oclouds, m.category ocat
-       FROM nws_hourly f JOIN metars m ON m.station=f.station AND m.hour_time=f.valid_time AND m.type='METAR'
-       WHERE f.station=? AND f.valid_time>=? AND f.valid_time<? AND f.issued<=f.valid_time`,
-    )
-    .all(station, since, Date.now()) as Array<Record<string, number | string | null>>;
+  const now = Date.now();
+  const [fcstRows, obsMap] = await Promise.all([
+    selectAll<{ issued: number; valid_time: number; temp_c: number | null; dewp_c: number | null; wind_dir: number | null; wind_spd: number | null; sky_pct: number | null; ceiling_ft: number | null; vis_sm: number | null }>((r0, r1) =>
+      db.from('wxc_nws_hourly').select('issued,valid_time,temp_c,dewp_c,wind_dir,wind_spd,sky_pct,ceiling_ft,vis_sm').eq('station', station).gte('valid_time', since).lt('valid_time', now).range(r0, r1),
+    ),
+    loadObsForJoin(db, station, since, now),
+  ]);
   // one obs per hour: prefer the first
   const seen = new Set<string>();
-  const groups = new Map<number, typeof rows>();
-  for (const r of rows) {
-    const key = `${r.issued}|${r.valid_time}`;
+  const groups = new Map<number, Array<Record<string, number | string | null>>>();
+  for (const f of fcstRows) {
+    if (f.issued > f.valid_time) continue;
+    const key = `${f.issued}|${f.valid_time}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    const lead = Math.floor(((r.valid_time as number) - (r.issued as number)) / DAY);
+    const o = obsMap.get(f.valid_time);
+    if (!o) continue;
+    const lead = Math.floor((f.valid_time - f.issued) / DAY);
     if (lead < 0 || lead > 7) continue;
+    const r: Record<string, number | string | null> = {
+      ft: f.temp_c, fd: f.dewp_c, fwd: f.wind_dir, fws: f.wind_spd, fsky: f.sky_pct, fc: f.ceiling_ft, fv: f.vis_sm,
+      ot: o.temp_c, od: o.dewp_c, owd: o.wind_dir, owv: o.wind_var, ows: o.wind_spd, oclouds: o.clouds, ocat: o.category,
+    };
     const arr = groups.get(lead) ?? [];
     arr.push(r);
     groups.set(lead, arr);
@@ -512,23 +567,35 @@ export function modelCategoryProxy(m: { cloudLowPct: number | null; cloudPct: nu
   return { cat, ceilingGuessFt: ceilingGuess, visGuessSm: visGuess == null ? null : Math.round(visGuess * 100) / 100 };
 }
 
-export function modelVerification(db: DB, station: string, days: number): ModelLeadStats[] {
+export async function modelVerification(db: DB, station: string, days: number): Promise<ModelLeadStats[]> {
   const since = Date.now() - days * DAY;
-  const rows = db
-    .prepare(
-      `SELECT f.model, f.lead_days, f.valid_time, f.temp_c ft, f.dewp_c fd, f.wind_dir fwd, f.wind_spd fws, f.cloud_low_pct flow, f.cloud_pct fcl, f.vis_m fv, f.wx_code fwx, f.precip_mm fp,
-              m.temp_c ot, m.dewp_c od, m.wind_dir owd, m.wind_var owv, m.wind_spd ows, m.clouds oclouds, m.category ocat, m.ceiling_ft oceil
-       FROM model_hourly f JOIN metars m ON m.station=f.station AND m.hour_time=f.valid_time AND m.type='METAR'
-       WHERE f.station=? AND f.valid_time>=? AND f.valid_time<? AND f.lead_days>0`,
-    )
-    .all(station, since, Date.now()) as Array<Record<string, number | string | null>>;
-  const groups = new Map<string, typeof rows>();
+  const now = Date.now();
+  const [fcstRows, obsMap] = await Promise.all([
+    selectAll<{ model: string; lead_days: number; valid_time: number; temp_c: number | null; dewp_c: number | null; wind_dir: number | null; wind_spd: number | null; cloud_low_pct: number | null; cloud_pct: number | null; vis_m: number | null; wx_code: number | null; precip_mm: number | null }>((r0, r1) =>
+      db
+        .from('wxc_model_hourly')
+        .select('model,lead_days,valid_time,temp_c,dewp_c,wind_dir,wind_spd,cloud_low_pct,cloud_pct,vis_m,wx_code,precip_mm')
+        .eq('station', station)
+        .gt('lead_days', 0)
+        .gte('valid_time', since)
+        .lt('valid_time', now)
+        .range(r0, r1),
+    ),
+    loadObsForJoin(db, station, since, now),
+  ]);
+  const groups = new Map<string, Array<Record<string, number | string | null>>>();
   const seen = new Set<string>();
-  for (const r of rows) {
-    const key = `${r.model}|${r.lead_days}|${r.valid_time}`;
+  for (const f of fcstRows) {
+    const key = `${f.model}|${f.lead_days}|${f.valid_time}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    const g = `${r.model}|${r.lead_days}`;
+    const o = obsMap.get(f.valid_time);
+    if (!o) continue;
+    const g = `${f.model}|${f.lead_days}`;
+    const r: Record<string, number | string | null> = {
+      ft: f.temp_c, fd: f.dewp_c, fwd: f.wind_dir, fws: f.wind_spd, flow: f.cloud_low_pct, fcl: f.cloud_pct, fv: f.vis_m, fwx: f.wx_code, fp: f.precip_mm,
+      ot: o.temp_c, od: o.dewp_c, owd: o.wind_dir, owv: o.wind_var, ows: o.wind_spd, oclouds: o.clouds, ocat: o.category, oceil: o.ceiling_ft,
+    };
     const arr = groups.get(g) ?? [];
     arr.push(r);
     groups.set(g, arr);
@@ -571,8 +638,8 @@ export function modelVerification(db: DB, station: string, days: number): ModelL
 }
 
 /** Full verification report for a station. */
-export function report(db: DB, station: string, days: number) {
-  const all = loadRows(db, station, days);
+export async function report(db: DB, station: string, days: number) {
+  const all = await loadRows(db, station, days);
   const op = all.filter((r) => r.operative === 1);
   const byLead = LEAD_BUCKETS.map((b) => {
     const rs = all.filter((r) => r.lead_hours >= b.min && r.lead_hours < b.max);
@@ -584,16 +651,23 @@ export function report(db: DB, station: string, days: number) {
     };
   });
   const span = all.length ? { from: all[0].hour_time, to: all[all.length - 1].hour_time } : null;
+  const [bustsResult, amendments, nws, models, climatologyResult] = await Promise.all([
+    busts(db, op, 40),
+    amendmentStats(db, station, days),
+    nwsVerification(db, station, days),
+    modelVerification(db, station, days),
+    climatology(db, station),
+  ]);
   return {
     station, days, span, pairs: all.length, operativePairs: op.length,
     operative: { errors: elementErrors(op), ifr: contingency(op, 'IFR'), mvfr: contingency(op, 'MVFR'), lifr: contingency(op, 'LIFR'), confusion: confusion(op).matrix, histograms: errorHistograms(op), wx: wxVerification(op) },
     byLead,
     calibration: calibration(all),
     diurnal: diurnal(op),
-    busts: busts(db, op, 40),
-    amendments: amendmentStats(db, station, days),
-    nws: nwsVerification(db, station, days),
-    models: modelVerification(db, station, days),
-    climatology: climatology(db, station),
+    busts: bustsResult,
+    amendments,
+    nws,
+    models,
+    climatology: climatologyResult,
   };
 }

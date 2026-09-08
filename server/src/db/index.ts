@@ -1,200 +1,92 @@
-import Database from 'better-sqlite3';
-import fs from 'node:fs';
-import path from 'node:path';
-import { config } from '../config.js';
+/**
+ * Data layer: Supabase Postgres reached over the PostgREST HTTPS API (no direct Postgres
+ * connection). This runs equally well from a long-lived Node process or a Vercel serverless
+ * function (no connection pool to exhaust across many concurrent Lambda instances).
+ *
+ * Tables live in the `public` schema of a shared Supabase project, prefixed `wxc_` so they
+ * cannot collide with that project's other application (a separate product in the `pilot`
+ * schema). RLS policies scope the anon key used here to just these `wxc_*` tables. This key
+ * is a server-side secret in this app: only Vercel/Node env vars hold it, it is never sent to
+ * the browser (the frontend only ever talks to this app's own API).
+ */
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
-export type DB = Database.Database;
+export type DB = SupabaseClient;
 
-let db: DB | null = null;
+let client: DB | null = null;
 
 export function getDb(): DB {
-  if (db) return db;
-  fs.mkdirSync(config.dataDir, { recursive: true });
-  const file = path.join(config.dataDir, 'wx.db');
-  db = new Database(file);
-  db.pragma('journal_mode = WAL');
-  db.pragma('synchronous = NORMAL');
-  db.pragma('foreign_keys = ON');
-  migrate(db);
-  return db;
+  if (client) return client;
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_ANON_KEY;
+  if (!url || !key) {
+    throw new Error('SUPABASE_URL and SUPABASE_ANON_KEY must be set (see .env.example).');
+  }
+  client = createClient(url, key, { auth: { persistSession: false } });
+  return client;
 }
 
-export function openMemoryDb(): DB {
-  const m = new Database(':memory:');
-  migrate(m);
-  return m;
+/** For tests: inject a specific client (e.g. pointed at a disposable project). */
+export function setDb(c: DB) {
+  client = c;
 }
 
-function migrate(d: DB) {
-  d.exec(`
-  CREATE TABLE IF NOT EXISTS stations (
-    icao TEXT PRIMARY KEY,
-    name TEXT,
-    lat REAL NOT NULL,
-    lon REAL NOT NULL,
-    elev_ft INTEGER,
-    state TEXT,
-    country TEXT,
-    tz TEXT,
-    iata TEXT,
-    faa TEXT,
-    has_taf INTEGER DEFAULT 1,
-    nws_office TEXT,
-    nws_grid_id TEXT,
-    nws_grid_x INTEGER,
-    nws_grid_y INTEGER,
-    nws_radar TEXT,
-    added_at INTEGER NOT NULL,
-    backfill_days INTEGER,
-    backfill_status TEXT DEFAULT 'pending',
-    backfill_message TEXT,
-    backfill_done_at INTEGER,
-    enabled INTEGER DEFAULT 1
-  );
+export class DbError extends Error {
+  constructor(message: string, public cause?: unknown) {
+    super(message);
+  }
+}
 
-  CREATE TABLE IF NOT EXISTS metars (
-    id INTEGER PRIMARY KEY,
-    station TEXT NOT NULL,
-    obs_time INTEGER NOT NULL,
-    hour_time INTEGER NOT NULL,
-    type TEXT NOT NULL,
-    raw TEXT NOT NULL,
-    ceiling_ft INTEGER,
-    vis_sm REAL,
-    category TEXT,
-    wind_dir INTEGER,
-    wind_var INTEGER DEFAULT 0,
-    wind_spd INTEGER,
-    wind_gust INTEGER,
-    temp_c REAL,
-    dewp_c REAL,
-    altim_inhg REAL,
-    slp_hpa REAL,
-    wx TEXT,
-    clouds TEXT,
-    decoded TEXT NOT NULL,
-    source TEXT NOT NULL,
-    UNIQUE(station, obs_time, raw)
-  );
-  CREATE INDEX IF NOT EXISTS idx_metars_station_time ON metars(station, obs_time);
-  CREATE INDEX IF NOT EXISTS idx_metars_station_hour ON metars(station, hour_time);
+/** Throw with a useful message on a PostgREST error; otherwise return `data`. */
+export function unwrap<T>(res: { data: T | null; error: { message: string; details?: string | null } | null }, context: string): T {
+  if (res.error) throw new DbError(`${context}: ${res.error.message}${res.error.details ? ` (${res.error.details})` : ''}`, res.error);
+  return (res.data ?? (Array.isArray(res.data) ? [] : null)) as T;
+}
 
-  CREATE TABLE IF NOT EXISTS tafs (
-    id INTEGER PRIMARY KEY,
-    station TEXT NOT NULL,
-    issued INTEGER NOT NULL,
-    valid_from INTEGER NOT NULL,
-    valid_to INTEGER NOT NULL,
-    amended INTEGER DEFAULT 0,
-    raw TEXT NOT NULL,
-    decoded TEXT NOT NULL,
-    hours TEXT NOT NULL,
-    source TEXT NOT NULL,
-    UNIQUE(station, issued, raw)
-  );
-  CREATE INDEX IF NOT EXISTS idx_tafs_station_issued ON tafs(station, issued);
+const CHUNK = 500;
 
-  CREATE TABLE IF NOT EXISTS taf_verification (
-    id INTEGER PRIMARY KEY,
-    station TEXT NOT NULL,
-    metar_id INTEGER NOT NULL,
-    taf_id INTEGER NOT NULL,
-    obs_time INTEGER NOT NULL,
-    hour_time INTEGER NOT NULL,
-    taf_issued INTEGER NOT NULL,
-    lead_hours REAL NOT NULL,
-    operative INTEGER NOT NULL,
-    hour_utc INTEGER NOT NULL,
-    fcst_cat TEXT,
-    obs_cat TEXT,
-    worst_cat TEXT,
-    cat_hit INTEGER,
-    cat_err INTEGER,
-    tempo_covered INTEGER,
-    fcst_ceiling INTEGER,
-    obs_ceiling INTEGER,
-    fcst_vis REAL,
-    obs_vis REAL,
-    fcst_wdir INTEGER,
-    obs_wdir INTEGER,
-    fcst_wspd INTEGER,
-    obs_wspd INTEGER,
-    fcst_gust INTEGER,
-    obs_gust INTEGER,
-    fcst_wx TEXT,
-    obs_wx TEXT,
-    ceiling_err INTEGER,
-    ceiling_log_err REAL,
-    vis_err REAL,
-    wdir_err INTEGER,
-    wspd_err INTEGER,
-    UNIQUE(metar_id, taf_id)
-  );
-  CREATE INDEX IF NOT EXISTS idx_tv_station_time ON taf_verification(station, hour_time);
-  CREATE INDEX IF NOT EXISTS idx_tv_station_lead ON taf_verification(station, lead_hours);
+/**
+ * Upsert a large array in bounded-size batches (PostgREST accepts one JSON array per request;
+ * chunking keeps request bodies small and avoids any single-request row-count limits).
+ * Returns the rows PostgREST actually reports back (empty when ignoreDuplicates skipped them).
+ */
+export async function upsertChunked<T extends object, R = T>(
+  db: DB,
+  table: string,
+  rows: T[],
+  onConflict: string,
+  opts: { ignoreDuplicates?: boolean; select?: string } = {},
+): Promise<R[]> {
+  const out: R[] = [];
+  for (let i = 0; i < rows.length; i += CHUNK) {
+    const batch = rows.slice(i, i + CHUNK);
+    if (!batch.length) continue;
+    const res = await db
+      .from(table)
+      .upsert(batch, { onConflict, ignoreDuplicates: opts.ignoreDuplicates ?? false })
+      .select(opts.select ?? '*');
+    if (res.error) throw new DbError(`upsert ${table}: ${res.error.message}`, res.error);
+    out.push(...((res.data ?? []) as R[]));
+  }
+  return out;
+}
 
-  CREATE TABLE IF NOT EXISTS nws_hourly (
-    station TEXT NOT NULL,
-    issued INTEGER NOT NULL,
-    valid_time INTEGER NOT NULL,
-    fetched_at INTEGER NOT NULL,
-    temp_c REAL,
-    dewp_c REAL,
-    rh INTEGER,
-    wind_dir INTEGER,
-    wind_spd INTEGER,
-    wind_gust INTEGER,
-    sky_pct INTEGER,
-    pop INTEGER,
-    ceiling_ft INTEGER,
-    vis_sm REAL,
-    wx TEXT,
-    qpf_mm REAL,
-    short_forecast TEXT,
-    prob_thunder INTEGER,
-    PRIMARY KEY(station, issued, valid_time)
-  );
-
-  CREATE TABLE IF NOT EXISTS model_hourly (
-    station TEXT NOT NULL,
-    model TEXT NOT NULL,
-    run_time INTEGER NOT NULL,
-    lead_days INTEGER NOT NULL,
-    valid_time INTEGER NOT NULL,
-    fetched_at INTEGER NOT NULL,
-    temp_c REAL,
-    dewp_c REAL,
-    wind_dir INTEGER,
-    wind_spd REAL,
-    wind_gust REAL,
-    cloud_pct INTEGER,
-    cloud_low_pct INTEGER,
-    cloud_mid_pct INTEGER,
-    vis_m REAL,
-    precip_mm REAL,
-    pop INTEGER,
-    wx_code INTEGER,
-    cape REAL,
-    pressure_hpa REAL,
-    boundary_layer_m REAL,
-    PRIMARY KEY(station, model, lead_days, valid_time)
-  );
-  CREATE INDEX IF NOT EXISTS idx_model_station_valid ON model_hourly(station, valid_time);
-
-  CREATE TABLE IF NOT EXISTS ingest_log (
-    id INTEGER PRIMARY KEY,
-    at INTEGER NOT NULL,
-    source TEXT NOT NULL,
-    station TEXT,
-    ok INTEGER NOT NULL,
-    message TEXT,
-    count INTEGER
-  );
-  CREATE INDEX IF NOT EXISTS idx_ingest_at ON ingest_log(at);
-
-  CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT
-  );
-  `);
+/**
+ * PostgREST caps a single response at 1000 rows by default. Any query that can plausibly
+ * exceed that (verification history, long-lived METAR/TAF archives, multi-model guidance)
+ * MUST page through with this helper instead of a bare `.select()`, or results silently
+ * truncate. `build` constructs a fresh query for the given inclusive [from, to] row range.
+ */
+export async function selectAll<T>(build: (from: number, to: number) => PromiseLike<{ data: T[] | null; error: { message: string } | null }>, pageSize = 1000): Promise<T[]> {
+  const out: T[] = [];
+  let from = 0;
+  for (;;) {
+    const res = await build(from, from + pageSize - 1);
+    if (res.error) throw new DbError(`selectAll: ${res.error.message}`);
+    const page = res.data ?? [];
+    out.push(...page);
+    if (page.length < pageSize) break;
+    from += pageSize;
+  }
+  return out;
 }

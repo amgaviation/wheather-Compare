@@ -3,6 +3,7 @@
  * incremental verification.
  */
 import type { DB } from '../db/index.js';
+import { DbError, upsertChunked } from '../db/index.js';
 import { config } from '../config.js';
 import * as awc from '../sources/awc.js';
 import * as nws from '../sources/nws.js';
@@ -13,52 +14,35 @@ import { verifyStation } from './verify.js';
 const HOUR = 3600_000;
 
 export async function pollMetars(db: DB): Promise<void> {
-  const stations = listStations(db, true);
+  const stations = await listStations(db, true);
   if (!stations.length) return;
   const ids = stations.map((s) => s.icao);
   try {
     const rows = await awc.fetchMetars(ids, 3);
-    const touched = new Set<string>();
-    let inserted = 0;
-    const tx = db.transaction(() => {
-      for (const r of rows) {
-        const ref = new Date((r.obsTime ?? Date.now() / 1000) * 1000);
-        const res = insertMetar(db, r.icaoId, r.rawOb, ref, 'awc', r.metarType);
-        if (res.inserted) {
-          inserted++;
-          touched.add(r.icaoId);
-        }
-      }
-    });
-    tx();
-    for (const s of touched) verifyStation(db, s, Date.now() - 36 * HOUR, Date.now() + HOUR);
-    log(db, 'awc.metar', null, true, `fetched ${rows.length}, new ${inserted}`, inserted);
+    const results = await Promise.all(
+      rows.map((r) => insertMetar(db, r.icaoId, r.rawOb, new Date((r.obsTime ?? Date.now() / 1000) * 1000), 'awc', r.metarType).then((res) => ({ icao: r.icaoId, res }))),
+    );
+    const touched = new Set(results.filter((r) => r.res.inserted).map((r) => r.icao));
+    const inserted = results.filter((r) => r.res.inserted).length;
+    for (const s of touched) await verifyStation(db, s, Date.now() - 36 * HOUR, Date.now() + HOUR);
+    await log(db, 'awc.metar', null, true, `fetched ${rows.length}, new ${inserted}`, inserted);
   } catch (e) {
-    log(db, 'awc.metar', null, false, String(e));
+    await log(db, 'awc.metar', null, false, String(e));
   }
 }
 
 export async function pollTafs(db: DB): Promise<void> {
-  const stations = listStations(db, true).filter((s) => s.has_taf);
+  const stations = (await listStations(db, true)).filter((s) => s.has_taf);
   if (!stations.length) return;
   try {
     const rows = await awc.fetchTafs(stations.map((s) => s.icao));
-    const touched = new Set<string>();
-    let inserted = 0;
-    const tx = db.transaction(() => {
-      for (const r of rows) {
-        const res = insertTaf(db, r.icaoId, r.rawTAF, new Date(r.issueTime), 'awc');
-        if (res.inserted) {
-          inserted++;
-          touched.add(r.icaoId);
-        }
-      }
-    });
-    tx();
-    for (const s of touched) verifyStation(db, s, Date.now() - 36 * HOUR, Date.now() + HOUR);
-    log(db, 'awc.taf', null, true, `fetched ${rows.length}, new ${inserted}`, inserted);
+    const results = await Promise.all(rows.map((r) => insertTaf(db, r.icaoId, r.rawTAF, new Date(r.issueTime), 'awc').then((res) => ({ icao: r.icaoId, res }))));
+    const touched = new Set(results.filter((r) => r.res.inserted).map((r) => r.icao));
+    const inserted = results.filter((r) => r.res.inserted).length;
+    for (const s of touched) await verifyStation(db, s, Date.now() - 36 * HOUR, Date.now() + HOUR);
+    await log(db, 'awc.taf', null, true, `fetched ${rows.length}, new ${inserted}`, inserted);
   } catch (e) {
-    log(db, 'awc.taf', null, false, String(e));
+    await log(db, 'awc.taf', null, false, String(e));
   }
 }
 
@@ -100,71 +84,68 @@ export async function pollNws(db: DB, st: StationRow): Promise<void> {
         for (let t = Math.floor(start / HOUR) * HOUR; t < start + dur; t += HOUR) wxMap.set(t, txt);
       }
     }
-    const ins = db.prepare(`INSERT OR REPLACE INTO nws_hourly(station, issued, valid_time, fetched_at, temp_c, dewp_c, rh, wind_dir, wind_spd, wind_gust, sky_pct, pop, ceiling_ft, vis_sm, wx, qpf_mm, short_forecast, prob_thunder)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-    let n = 0;
-    const tx = db.transaction(() => {
-      for (const p of hourly.periods) {
-        const t = Date.parse(p.startTime);
-        const tempC = p.temperatureUnit === 'F' ? Math.round(((p.temperature - 32) * 5) / 9 * 10) / 10 : p.temperature;
-        const dewp = p.dewpoint?.value ?? null;
-        const dewpC = dewp == null ? null : p.dewpoint.unitCode.includes('degF') ? Math.round((((dewp - 32) * 5) / 9) * 10) / 10 : Math.round(dewp * 10) / 10;
-        const wdir = wdirGrid.get(t) ?? nws.compassToDeg(p.windDirection);
-        const c = ceiling.get(t);
-        const v = vis.get(t);
-        const g = gust.get(t);
-        const q = qpf.get(t);
-        ins.run(
-          st.icao, issued, t, now, tempC, dewpC, p.relativeHumidity?.value ?? null, wdir == null ? null : Math.round(wdir), parseNwsWind(p.windSpeed),
-          g == null ? null : Math.round(g * 0.539957), sky.get(t) ?? null, p.probabilityOfPrecipitation?.value ?? null,
-          c == null ? null : Math.round(c * 3.28084), v == null ? null : Math.round((v / 1609.34) * 100) / 100, wxMap.get(t) ?? null, q ?? null, p.shortForecast, thunder.get(t) ?? null,
-        );
-        n++;
-      }
+    const rows = hourly.periods.map((p) => {
+      const t = Date.parse(p.startTime);
+      const tempC = p.temperatureUnit === 'F' ? Math.round(((p.temperature - 32) * 5) / 9 * 10) / 10 : p.temperature;
+      const dewp = p.dewpoint?.value ?? null;
+      const dewpC = dewp == null ? null : p.dewpoint.unitCode.includes('degF') ? Math.round((((dewp - 32) * 5) / 9) * 10) / 10 : Math.round(dewp * 10) / 10;
+      const wdir = wdirGrid.get(t) ?? nws.compassToDeg(p.windDirection);
+      const c = ceiling.get(t);
+      const v = vis.get(t);
+      const g = gust.get(t);
+      const q = qpf.get(t);
+      return {
+        station: st.icao, issued, valid_time: t, fetched_at: now, temp_c: tempC, dewp_c: dewpC, rh: p.relativeHumidity?.value ?? null,
+        wind_dir: wdir == null ? null : Math.round(wdir), wind_spd: parseNwsWind(p.windSpeed), wind_gust: g == null ? null : Math.round(g * 0.539957),
+        sky_pct: sky.get(t) ?? null, pop: p.probabilityOfPrecipitation?.value ?? null, ceiling_ft: c == null ? null : Math.round(c * 3.28084),
+        vis_sm: v == null ? null : Math.round((v / 1609.34) * 100) / 100, wx: wxMap.get(t) ?? null, qpf_mm: q ?? null, short_forecast: p.shortForecast, prob_thunder: thunder.get(t) ?? null,
+      };
     });
-    tx();
-    log(db, 'nws.hourly', st.icao, true, `issued ${hourly.updateTime}, ${n} hours`, n);
+    const written = await upsertChunked(db, 'wxc_nws_hourly', rows, 'station,issued,valid_time', { select: 'station' });
+    await log(db, 'nws.hourly', st.icao, true, `issued ${hourly.updateTime}, ${written.length} hours`, written.length);
   } catch (e) {
-    log(db, 'nws.hourly', st.icao, false, String(e));
+    await log(db, 'nws.hourly', st.icao, false, String(e));
   }
 }
 
 export async function pollModels(db: DB, st: StationRow, includePreviousRuns = false): Promise<void> {
   if (!config.useOpenMeteo) return;
   const now = Date.now();
-  const ins = db.prepare(`INSERT OR REPLACE INTO model_hourly(station, model, run_time, lead_days, valid_time, fetched_at, temp_c, dewp_c, wind_dir, wind_spd, wind_gust, cloud_pct, cloud_low_pct, cloud_mid_pct, vis_m, precip_mm, pop, wx_code, cape, pressure_hpa, boundary_layer_m)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
   try {
-    const rows = await om.fetchModelForecast(st.lat, st.lon, 7);
+    const forecast = await om.fetchModelForecast(st.lat, st.lon, 7);
     const runTime = Math.floor(now / HOUR) * HOUR;
-    const tx = db.transaction(() => {
-      for (const r of rows) {
-        ins.run(st.icao, r.model, runTime, 0, r.validTime, now, r.tempC, r.dewpC, r.windDir, r.windKt, r.gustKt, r.cloudPct, r.cloudLowPct, r.cloudMidPct, r.visM, r.precipMm, r.pop, r.wxCode, r.cape, r.pressureHpa, r.blHeightM);
-      }
-    });
-    tx();
-    log(db, 'openmeteo.forecast', st.icao, true, `${rows.length} rows`, rows.length);
+    const rows = forecast.map((r) => ({
+      station: st.icao, model: r.model, run_time: runTime, lead_days: 0, valid_time: r.validTime, fetched_at: now,
+      temp_c: r.tempC, dewp_c: r.dewpC, wind_dir: r.windDir, wind_spd: r.windKt, wind_gust: r.gustKt, cloud_pct: r.cloudPct, cloud_low_pct: r.cloudLowPct,
+      cloud_mid_pct: r.cloudMidPct, vis_m: r.visM, precip_mm: r.precipMm, pop: r.pop, wx_code: r.wxCode, cape: r.cape, pressure_hpa: r.pressureHpa, boundary_layer_m: r.blHeightM,
+    }));
+    const written = await upsertChunked(db, 'wxc_model_hourly', rows, 'station,model,lead_days,valid_time', { select: 'station' });
+    await log(db, 'openmeteo.forecast', st.icao, true, `${written.length} rows`, written.length);
   } catch (e) {
-    log(db, 'openmeteo.forecast', st.icao, false, String(e));
+    await log(db, 'openmeteo.forecast', st.icao, false, String(e));
   }
   if (includePreviousRuns) {
     try {
-      const rows = await om.fetchPreviousRuns(st.lat, st.lon, 7, [1, 2, 3, 5]);
-      const tx = db.transaction(() => {
-        for (const r of rows) {
-          ins.run(st.icao, r.model, r.validTime - r.leadDays * 24 * HOUR, r.leadDays, r.validTime, now, r.tempC, r.dewpC, r.windDir, r.windKt, r.gustKt, r.cloudPct, r.cloudLowPct, r.cloudMidPct, r.visM, r.precipMm, r.pop, r.wxCode, r.cape, r.pressureHpa, r.blHeightM);
-        }
-      });
-      tx();
-      log(db, 'openmeteo.previous', st.icao, true, `${rows.length} rows`, rows.length);
+      const prev = await om.fetchPreviousRuns(st.lat, st.lon, 7, [1, 2, 3, 5]);
+      const rows = prev.map((r) => ({
+        station: st.icao, model: r.model, run_time: r.validTime - r.leadDays * 24 * HOUR, lead_days: r.leadDays, valid_time: r.validTime, fetched_at: now,
+        temp_c: r.tempC, dewp_c: r.dewpC, wind_dir: r.windDir, wind_spd: r.windKt, wind_gust: r.gustKt, cloud_pct: r.cloudPct, cloud_low_pct: r.cloudLowPct,
+        cloud_mid_pct: r.cloudMidPct, vis_m: r.visM, precip_mm: r.precipMm, pop: r.pop, wx_code: r.wxCode, cape: r.cape, pressure_hpa: r.pressureHpa, boundary_layer_m: r.blHeightM,
+      }));
+      const written = await upsertChunked(db, 'wxc_model_hourly', rows, 'station,model,lead_days,valid_time', { select: 'station' });
+      await log(db, 'openmeteo.previous', st.icao, true, `${written.length} rows`, written.length);
     } catch (e) {
-      log(db, 'openmeteo.previous', st.icao, false, String(e));
+      await log(db, 'openmeteo.previous', st.icao, false, String(e));
     }
   }
 }
 
-/** Snapshot of lead-0 model data keeps only the latest run per valid hour; older lead-0 runs are pruned (previous-runs API supplies history). */
-export function pruneModelRuns(db: DB) {
-  db.prepare('DELETE FROM model_hourly WHERE lead_days=0 AND fetched_at < ?').run(Date.now() - 2 * 24 * HOUR);
-  db.prepare('DELETE FROM nws_hourly WHERE fetched_at < ?').run(Date.now() - 400 * 24 * HOUR);
+/** Lead-0 model rows keep only the latest run per valid hour; older lead-0 rows are pruned (the previous-runs API supplies history instead). */
+export async function pruneModelRuns(db: DB): Promise<void> {
+  const cutoffModel = Date.now() - 2 * 24 * HOUR;
+  const cutoffNws = Date.now() - 400 * 24 * HOUR;
+  const r1 = await db.from('wxc_model_hourly').delete().eq('lead_days', 0).lt('fetched_at', cutoffModel);
+  if (r1.error) throw new DbError(`pruneModelRuns: ${r1.error.message}`, r1.error);
+  const r2 = await db.from('wxc_nws_hourly').delete().lt('fetched_at', cutoffNws);
+  if (r2.error) throw new DbError(`pruneModelRuns: ${r2.error.message}`, r2.error);
 }
