@@ -256,7 +256,7 @@ function TimelineCard({ station }: { station: Station }) {
               <ReferenceLine y={1000} stroke={CAT_COLOR.IFR} strokeDasharray="3 3" />
               <ReferenceLine y={3000} stroke={CAT_COLOR.MVFR} strokeDasharray="3 3" />
               {nowLabel && <ReferenceLine x={nowLabel} stroke="#fff" strokeDasharray="2 2" />}
-              <Area type="stepAfter" dataKey="worstCeil" name="TAF worst-case ceiling" stroke="none" fill="#f59e0b" fillOpacity={0.12} />
+              <Area type="stepAfter" dataKey={(d: Pt) => (d.worstCeil != null && d.fcstCeil != null ? [d.worstCeil, d.fcstCeil] : null)} name="TAF worst-case range" stroke="none" fill="#f59e0b" fillOpacity={0.35} isAnimationActive={false} />
               <Line type="stepAfter" dataKey="fcstCeil" name="TAF ceiling" stroke="#60a5fa" dot={false} strokeWidth={2} connectNulls />
               <Line type="stepAfter" dataKey="nwsCeil" name="NWS grid ceiling" stroke="#a78bfa" dot={false} strokeDasharray="4 2" connectNulls />
               <Line type="monotone" dataKey="obsCeil" name="Observed ceiling" stroke="#f8fafc" dot={{ r: 2 }} strokeWidth={1.5} connectNulls />
@@ -330,13 +330,39 @@ function RecentVerificationCard({ station }: { station: Station }) {
 }
 
 function NwsCard({ station }: { station: Station }) {
-  const { data } = useAsync(() => api.history(station.icao, 6), [station.icao], 10 * 60_000);
-  const issued = data?.nws[0];
+  const { data, error } = useAsync(() => api.outlook(station.icao, 24), [station.icao], 10 * 60_000);
+  if (error) return <Card title="Next 12 h: NWS grid vs TAF"><ErrorBox error={error} /></Card>;
+  const hours = (data?.hours ?? []).slice(0, 12);
   return (
-    <Card title="NWS gridpoint forecast" sub={issued ? `${station.nws_office} · issued ${zulu(issued.issued, true)}` : 'not yet fetched'}>
-      {!issued ? <div className="muted small">The NWS hourly forecast is fetched hourly; grid ceiling/visibility drive the outlook beyond the TAF window.</div> : (
-        <div className="muted small">Latest issuance stored. Full hourly detail is on the Outlook page (sources per hour).</div>
-      )}
+    <Card title="Next 12 h: NWS grid vs TAF" sub={data?.sources.nws ? `${station.nws_office ?? ''} grid issued ${zulu(data.sources.nws.issued, true)}` : 'NWS forecast not yet fetched'}>
+      <div className="scroll-x">
+        <table className="tbl">
+          <thead><tr><th>Hour</th><th>TAF</th><th>NWS</th><th>Blend</th><th className="num">P(IFR+)</th><th className="num">Ceil</th><th className="num">Vis</th><th className="num">Sky</th><th className="num">PoP</th><th>Wind</th><th className="num">T/Td</th><th>NWS wording</th></tr></thead>
+          <tbody>
+            {hours.map((h) => {
+              const n = h.sources.nws;
+              return (
+                <tr key={h.time}>
+                  <td className="mono">{zulu(h.time)} <span className="muted">{local(h.time, station.tz)}</span></td>
+                  <td>{h.sources.taf ? <CatBadge cat={h.sources.taf.cat} /> : <span className="muted">—</span>}</td>
+                  <td>{n ? <CatBadge cat={n.cat} /> : <span className="muted">—</span>}</td>
+                  <td><CatBadge cat={h.likely} /></td>
+                  <td className="num" style={{ color: h.pIfrOrWorse >= 0.3 ? 'var(--ifr)' : undefined }}>{pct(h.pIfrOrWorse)}</td>
+                  <td className="num">{n?.ceilingFt != null ? n.ceilingFt.toLocaleString() : '—'}</td>
+                  <td className="num">{n?.visSm != null ? n.visSm : '—'}</td>
+                  <td className="num">{n?.skyPct != null ? `${n.skyPct}%` : '—'}</td>
+                  <td className="num">{n?.pop != null ? `${n.pop}%` : '—'}</td>
+                  <td className="mono">{n ? fmtWind(n.wind) : '—'}</td>
+                  <td className="num">{n ? `${num(n.tempC, 0)}/${num(n.dewpC, 0)}` : '—'}</td>
+                  <td className="small">{n?.shortForecast ?? ''}{n?.wx ? ` · ${n.wx}` : ''}</td>
+                </tr>
+              );
+            })}
+            {!hours.length && <tr><td colSpan={12} className="muted">Outlook not available yet.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+      <div className="muted tiny" style={{ marginTop: 6 }}>Blend and P(IFR+) come from the Outlook engine (TAF, NWS grid, models, climatology, persistence, each calibrated on this station's history).</div>
     </Card>
   );
 }
@@ -358,10 +384,8 @@ export default function Dashboard({ station }: { station: Station }) {
         <TafCard data={data} />
       </div>
       <TimelineCard station={station} />
-      <div className="grid cols-2">
-        <RecentVerificationCard station={station} />
-        <NwsCard station={station} />
-      </div>
+      <NwsCard station={station} />
+      <RecentVerificationCard station={station} />
     </div>
   );
 }

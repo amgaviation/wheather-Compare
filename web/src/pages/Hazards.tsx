@@ -1,7 +1,8 @@
 import React from 'react';
 import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
 import { api } from '../lib/api';
-import type { Station, StationHazards, AllHazards, WindsAloft } from '../lib/api';
+import type { Station, StationHazards, AllHazards } from '../lib/api';
 import { zulu, local, ago } from '../lib/format';
 import { Card, Loading, ErrorBox, Pill, useAsync } from '../components/ui';
 
@@ -110,7 +111,7 @@ export default function Hazards({ station }: { station: Station }) {
 
   const mapDiv = React.useRef<HTMLDivElement>(null);
   const mapRef = React.useRef<L.Map | null>(null);
-  const markerRef = React.useRef<L.Marker | null>(null);
+  const markerRef = React.useRef<L.CircleMarker | null>(null);
   const circleRef = React.useRef<L.Circle | null>(null);
   const layersRef = React.useRef<Record<Group, L.LayerGroup> | null>(null);
 
@@ -122,7 +123,7 @@ export default function Hazards({ station }: { station: Station }) {
     const groups = {} as Record<Group, L.LayerGroup>;
     for (const g of GROUPS) groups[g.key] = L.layerGroup().addTo(map);
     layersRef.current = groups;
-    markerRef.current = L.marker([station.lat, station.lon]).addTo(map).bindPopup(`${station.icao} ${station.name ?? ''}`);
+    markerRef.current = L.circleMarker([station.lat, station.lon], { radius: 7, color: '#fff', weight: 2, fillColor: '#60a5fa', fillOpacity: 1 }).addTo(map).bindPopup(`${station.icao} ${station.name ?? ''}`);
     circleRef.current = L.circle([station.lat, station.lon], { radius: radius * 1852, color: '#8f9bc4', weight: 1, dashArray: '4 4', fill: false }).addTo(map);
     mapRef.current = map;
     return () => {
@@ -228,8 +229,8 @@ export default function Hazards({ station }: { station: Station }) {
           {RADII.map((r) => <button key={r} className={r === radius ? 'active' : ''} onClick={() => setRadius(r)}>{r} nm</button>)}
         </div>
       </div>
-      {hz.error && <ErrorBox error={hz.error} />}
-      {all.error && <ErrorBox error={all.error} />}
+      {hz.error != null ? <ErrorBox error={hz.error} /> : null}
+      {all.error != null ? <ErrorBox error={all.error} /> : null}
 
       {/* a. Map */}
       <Card title="Hazard map" sub="all current CONUS products; click a shape for the raw text" right={all.loading ? <span className="muted small">loading hazards…</span> : undefined}>

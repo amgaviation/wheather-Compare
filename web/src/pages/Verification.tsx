@@ -206,7 +206,7 @@ export default function Verification({ station }: { station: Station }) {
         </div>
         {daysTabs}
       </div>
-      {error && <ErrorBox error={error} />}
+      {error != null ? <ErrorBox error={error} /> : null}
 
       {/* a. Headline */}
       <Card title="Headline" sub="operative TAF (the one a pilot would have read), all lead times">

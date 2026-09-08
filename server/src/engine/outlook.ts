@@ -463,7 +463,7 @@ export function buildOutlook(db: DB, st: StationRow, horizonHours = 120, history
     const agreeVals = hs.map((h): number | null => (h.sources.models.length >= 2 ? (new Set(h.sources.models.map((m) => m.cat)).size === 1 ? 1 : 0) : null)).filter((x): x is number => x != null);
     const conf = hs.reduce((s, h) => s + h.confidence, 0) / hs.length;
     const label = fmtLabel.format(new Date(noon));
-    const wTxt = windows.length ? windows.map((w) => `${fmtHm(w.from, tz)}–${fmtHm(w.to, tz)} ${w.likely}${w.pIfr >= 0.3 ? ` (P(IFR+) ${Math.round(w.pIfr * 100)}%)` : ''}`).join('; ') : 'no MVFR-or-worse periods expected';
+    const wTxt = windows.length ? windows.map((w) => `${fmtHm(w.from, tz)}–${fmtHm(w.to, tz)} ${w.likely}${w.pIfr >= 0.3 ? ` (P(IFR+) ${Math.round(w.pIfr * 100)}%)` : ''}`).join('; ') : 'VFR most likely every hour';
     days.push({
       date: k, label, sunrise: sun.sunrise, sunset: sun.sunset, hours: hs.length, worstLikely: worst, pAnyIfr: Math.round(pAnyIfr * 100) / 100, pAnyMvfr: Math.round(pAnyMvfr * 100) / 100,
       concernWindows: windows, maxGustKt: gusts.length ? Math.max(...gusts) : null, maxWindKt: winds.length ? Math.max(...winds) : null, maxPop: pops.length ? Math.max(...pops) : null,

@@ -20,7 +20,7 @@ async function main() {
     reply.code(status).send({ error: e.message ?? 'Internal error', issues: e.issues });
   });
   if (fs.existsSync(config.webDist)) {
-    await app.register(fastifyStatic, { root: config.webDist, prefix: '/', wildcard: false });
+    await app.register(fastifyStatic, { root: config.webDist, prefix: '/' });
     app.setNotFoundHandler((req, reply) => {
       if (req.url.startsWith('/api/')) return reply.code(404).send({ error: 'Not found' });
       return reply.sendFile('index.html');

@@ -53,8 +53,8 @@ function DayCards({ o }: { o: OutlookT }) {
             <CatBadge cat={d.worstLikely} title="Worst most-likely category during the day" />
           </div>
           <div className="row small" style={{ gap: 12 }}>
-            <span title="Probability of at least one IFR-or-worse period (6-h episodes)">IFR+ <strong style={{ color: d.pAnyIfr >= 0.5 ? 'var(--ifr)' : d.pAnyIfr >= 0.25 ? 'var(--warn)' : undefined }}>{pct(d.pAnyIfr)}</strong></span>
-            <span title="Probability of at least one MVFR-or-worse period">MVFR+ <strong>{pct(d.pAnyMvfr)}</strong></span>
+            <span title="Probability that at least one IFR-or-worse period occurs during the day (hours grouped into 6-h episodes)">any IFR+ <strong style={{ color: d.pAnyIfr >= 0.5 ? 'var(--ifr)' : d.pAnyIfr >= 0.25 ? 'var(--warn)' : undefined }}>{pct(d.pAnyIfr)}</strong></span>
+            <span title="Probability that at least one MVFR-or-worse period occurs during the day">any MVFR+ <strong>{pct(d.pAnyMvfr)}</strong></span>
             <span title="Mean probability of the most likely category">conf <strong>{pct(d.confidence)}</strong></span>
             {d.modelAgreement != null && <span title="Share of hours where all models agree on the category proxy">models agree <strong>{pct(d.modelAgreement)}</strong></span>}
           </div>
@@ -75,7 +75,7 @@ function DayCards({ o }: { o: OutlookT }) {
               ))}
             </ul>
           ) : (
-            <div className="small muted">No MVFR-or-worse periods expected.</div>
+            <div className="small muted">VFR is the most likely category every hour.</div>
           )}
         </div>
       ))}
@@ -250,7 +250,7 @@ export default function Outlook({ station }: { station: Station }) {
             <YAxis stroke="#8f9bc4" tick={{ fontSize: 10 }} domain={[0, 100]} width={34} unit="%" />
             <Tooltip {...tip} />
             <Legend wrapperStyle={{ fontSize: 11 }} />
-            <Area type="monotone" dataKey="night" name="night" stroke="none" fill="#000" fillOpacity={0.18} isAnimationActive={false} />
+            <Area type="step" dataKey="night" name="night" stroke="none" fill="#000" fillOpacity={0.25} isAnimationActive={false} legendType="none" tooltipType="none" />
             <Area type="monotone" dataKey="pMvfr" name="P(MVFR or worse)" stroke={CAT_COLOR.MVFR} fill={CAT_COLOR.MVFR} fillOpacity={0.2} />
             <Area type="monotone" dataKey="pIfr" name="P(IFR or worse)" stroke={CAT_COLOR.IFR} fill={CAT_COLOR.IFR} fillOpacity={0.35} />
           </ComposedChart>
@@ -265,7 +265,7 @@ export default function Outlook({ station }: { station: Station }) {
               <Legend wrapperStyle={{ fontSize: 11 }} />
               <ReferenceLine y={1000} stroke={CAT_COLOR.IFR} strokeDasharray="3 3" />
               <ReferenceLine y={3000} stroke={CAT_COLOR.MVFR} strokeDasharray="3 3" />
-              <Area type="stepAfter" dataKey="ceilLow" name="Pessimistic ceiling" stroke="none" fill="#f59e0b" fillOpacity={0.15} />
+              <Area type="stepAfter" dataKey={(d: { ceilLow: number; ceil: number }) => [d.ceilLow, d.ceil]} name="Pessimistic range" stroke="none" fill="#f59e0b" fillOpacity={0.35} isAnimationActive={false} />
               <Line type="stepAfter" dataKey="ceil" name="Expected ceiling" stroke="#60a5fa" dot={false} strokeWidth={2} />
             </ComposedChart>
           </ResponsiveContainer>

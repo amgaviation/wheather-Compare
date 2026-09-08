@@ -288,7 +288,7 @@ export default function Status({ stations, onChange }: { stations: Station[]; on
       <div className="grid cols-2">
         {/* d. System status */}
         <Card title="System status" sub={st ? `server time ${zulu(st.now, true)}` : undefined} right={status.loading && st ? <span className="muted small">refreshing…</span> : undefined}>
-          {status.error && <ErrorBox error={status.error} />}
+          {status.error != null ? <ErrorBox error={status.error} /> : null}
           {!st ? <Loading /> : (
             <>
               <div className="stats" style={{ marginBottom: 12 }}>

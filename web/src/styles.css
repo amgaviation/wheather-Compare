@@ -49,7 +49,8 @@ input, select { font: inherit; }
 .grid.cols-2 { grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }
 .grid.cols-3 { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
 .grid.cols-4 { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
-.card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+.grid > * { min-width: 0; }
+.card { min-width: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
 .card h3 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); font-weight: 600; display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
 .card h3 .sub { text-transform: none; letter-spacing: 0; font-weight: 400; font-size: 12px; }
 .card.span-2 { grid-column: span 2; }
@@ -100,7 +101,7 @@ ul.clean li { margin: 4px 0; }
 .hourstrip .cell.night .lbl { color: #6b7399; }
 .hourstrip .cell .lbl { font-size: 10px; }
 .hourstrip .cell .cur { outline: 2px solid var(--text); }
-.tafhour { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(34px, 1fr); gap: 2px; overflow-x: auto; }
+.tafhour { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(20px, 1fr); gap: 2px; overflow-x: auto; }
 .tafhour .h { display: flex; flex-direction: column; align-items: center; gap: 2px; font-family: var(--mono); font-size: 10px; color: var(--muted); }
 .tafhour .h .blk { width: 100%; height: 18px; border-radius: 3px; }
 .tafhour .h .blk.alt { height: 8px; opacity: 0.85; }
